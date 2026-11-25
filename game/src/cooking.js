@@ -1,559 +1,467 @@
-// Station cooking logic: carry stack, chopping, stove searing/burning, plating, serving, and binning.
+// Cooking stations for Midnight Bento Rush — chopping board, dual stove pans,
+// plating counter, serve window, trash bin, plus particles, popups and toasts.
+//
+// The kitchen loop: grab a raw ingredient from a pantry bin, chop it on the
+// board and/or sear it in a pan, then stack three finished items on the
+// plating counter and carry the completed plate to the serve window before
+// the ticket's patience runs out. A wrong item on the plate mismatches the
+// dish and must be binned at a two-second cost.
 
 import {
   INGREDIENT_META,
   RECIPE_MAP,
   findMatchingTicket,
   getCandidateRecipes,
-  getMissingIngredients,
   getPrioritizedCandidateRecipe,
-  itemSignature,
   matchRecipeFromItems,
   scoreServedOrder,
 } from './orders.js';
-import { STATION_BY_ID, distanceToStation } from './world.js';
 
-export const MAX_CARRY = 3;
+// Tuning — kept in one place so the kitchen's pace is easy to reason about.
 export const CHOP_DURATION = 1.2;
-export const COOK_DURATIONS = {
-  egg: 2.6,
-  salmon: 3.0,
-  chicken: 3.2,
-};
-export const BURN_GRACE = 5.5;
-export const BIN_PENALTY_SECONDS = 2.0;
+export const CHOP_AUTO_RATE = 0.55;
+export const CHOP_TAP_BOOST = 0.28;
+export const COOK_DURATIONS = { egg: 2.6, salmon: 3.0, chicken: 3.2 };
+export const BURN_LIMIT = 4.0;
+export const MAX_CARRY = 2;
+export const WRONG_PLATE_PENALTY = 2;
 
-export function createStationStates() {
+function emptyStove() {
   return {
-    chop: {
-      item: null,
-      progress: 0,
-      duration: CHOP_DURATION,
-      slashAnim: 0,
-      thockCooldown: 0,
-    },
-    stoves: [
-      { item: null, elapsed: 0, duration: 3.0, burnElapsed: 0, status: 'idle', sizzleCooldown: 0 },
-      { item: null, elapsed: 0, duration: 3.0, burnElapsed: 0, status: 'idle', sizzleCooldown: 0 },
-    ],
-    plate: {
-      items: [],
-      completedRecipeId: null,
-      mismatch: false,
-      flash: 0,
-    },
-    serveShowcase: {
-      recipeId: null,
-      timer: 0,
-      label: '',
-    },
-    particles: [],
-    popups: [],
-    toast: { text: '', color: '#ffd87a', timer: 0 },
+    item: null,
+    elapsed: 0,
+    duration: 0,
+    burnElapsed: 0,
+    status: 'empty',
+    sizzleCooldown: 0,
   };
 }
 
-export function pushToast(stations, text, color = '#ffd87a') {
-  stations.toast.text = text;
-  stations.toast.color = color;
-  stations.toast.timer = 2.0;
+export function createStationStates() {
+  return {
+    chop: { item: null, progress: 0, duration: CHOP_DURATION, slashAnim: 0 },
+    stoves: [emptyStove(), emptyStove()],
+    plate: { items: [], completedRecipeId: null, mismatch: false },
+    serveShowcase: null,
+    particles: [],
+    popups: [],
+    toast: { text: '', color: '#f7ead0', timer: 0 },
+  };
 }
 
-export function addPopup(stations, x, y, text, color = '#ffe074', subtext = '') {
-  stations.popups.push({
-    x,
-    y,
-    text,
-    subtext,
-    color,
-    age: 0,
-    life: 1.8,
-  });
+export function pushToast(stations, text, color = '#f7ead0') {
+  stations.toast = { text, color, timer: 2.8 };
 }
 
-export function addCookingParticles(stations, x, y, color, count = 8, kind = 'spark') {
+export function addPopup(stations, x, y, text, color, subtext = '') {
+  stations.popups.push({ x, y, text, color, subtext, timer: 1.7, life: 1.7 });
+}
+
+export function addCookingParticles(stations, x, y, color, count, kind) {
   for (let i = 0; i < count; i++) {
-    const angle = (Math.PI * 2 * i) / count + (i % 3) * 0.28;
-    const speed = kind === 'steam' ? 18 + (i % 4) * 9 : 48 + (i % 5) * 26;
+    const life = 0.55 + Math.random() * 0.5;
     stations.particles.push({
-      x: x + ((i % 3) - 1) * 8,
-      y: y + (((i + 1) % 3) - 1) * 6,
-      vx: kind === 'steam' ? ((i % 2 === 0 ? -1 : 1) * 10) : Math.cos(angle) * speed,
-      vy: kind === 'steam' ? -speed : Math.sin(angle) * speed - 22,
-      radius: kind === 'steam' ? 5 + (i % 3) * 2 : 3 + (i % 3),
+      x: x + (Math.random() - 0.5) * 16,
+      y: y + (Math.random() - 0.5) * 8,
+      vx: (Math.random() - 0.5) * (kind === 'spark' ? 95 : 16),
+      vy: kind === 'spark' ? -(45 + Math.random() * 75) : -(18 + Math.random() * 28),
+      life,
+      maxLife: life,
+      size: 2 + Math.random() * 3,
       color,
       kind,
-      age: 0,
-      life: kind === 'steam' ? 0.95 : 0.58,
     });
   }
 }
 
-export function isItemPlateable(item) {
-  if (!item || item.state === 'burnt') return false;
-  const meta = INGREDIENT_META[item.kind];
-  return Boolean(meta && item.state === meta.plateState);
+function carryHasRoom(chef) {
+  return chef.carry.length < MAX_CARRY;
 }
 
-export function isItemChoppable(item) {
-  if (!item) return false;
-  const meta = INGREDIENT_META[item.kind];
-  return Boolean(meta && meta.needsChop && item.state === 'raw');
+function takeCarriedItem(chef, predicate) {
+  const idx = chef.carry.findIndex(predicate);
+  if (idx === -1) return null;
+  return chef.carry.splice(idx, 1)[0];
 }
 
-export function isItemCookable(item) {
-  if (!item) return false;
-  const meta = INGREDIENT_META[item.kind];
-  if (!meta || !meta.needsCook) return false;
-  return meta.needsChop ? item.state === 'chopped' : item.state === 'raw';
+function handlePantry(game, station) {
+  const chef = game.world.chef;
+  const meta = INGREDIENT_META[station.ingredient];
+  if (!meta) return;
+  if (!carryHasRoom(chef)) {
+    pushToast(game.stations, 'HANDS FULL — PLATE OR BIN SOMETHING FIRST', '#ff9d8a');
+    game.sound.playErrorBuzz();
+    return;
+  }
+  chef.carry.push({ kind: meta.id, state: meta.initialState });
+  chef.actionBounce = 1;
+  game.sound.playPickup();
+  addCookingParticles(
+    game.stations,
+    station.x + station.w * 0.5,
+    station.y + 30,
+    'rgba(255,228,165,0.7)',
+    4,
+    'spark',
+  );
 }
 
-function chooseBestCarryIndexForPlate(carry, plateItems, activeTickets) {
-  const candidates = getCandidateRecipes(plateItems);
-  const placedSigs = plateItems.map(itemSignature);
-  const activeRecipeIds = new Set(activeTickets.map((t) => t.recipeId));
+function handleChopBoard(game) {
+  const chef = game.world.chef;
+  const chop = game.stations.chop;
 
-  // Prefer an item that completes or advances a currently ordered recipe.
-  for (let priority = 0; priority < 2; priority++) {
-    for (let i = 0; i < carry.length; i++) {
-      const item = carry[i];
-      if (!isItemPlateable(item)) continue;
-      const sig = itemSignature(item);
-      for (const recipe of candidates) {
-        if (priority === 0 && !activeRecipeIds.has(recipe.id)) continue;
-        const needed = recipe.ingredients.map(itemSignature);
-        for (const pSig of placedSigs) {
-          const pIdx = needed.indexOf(pSig);
-          if (pIdx !== -1) needed.splice(pIdx, 1);
-        }
-        if (needed.includes(sig)) return i;
-      }
+  // Nothing on the board: lay down something that needs chopping.
+  if (!chop.item) {
+    const raw = takeCarriedItem(
+      chef,
+      (item) => INGREDIENT_META[item.kind].needsChop && item.state === 'raw',
+    );
+    if (!raw) {
+      pushToast(game.stations, 'BRING GREENS, SALMON OR CHICKEN TO CHOP', '#ff9d8a');
+      game.sound.playErrorBuzz();
+      return;
     }
+    chop.item = raw;
+    chop.progress = 0;
+    chop.duration = CHOP_DURATION;
+    chef.actionBounce = 1;
+    game.sound.playPickup();
+    return;
   }
 
-  // Otherwise allow any plateable item (may cause a mismatch plate that must be binned).
-  return carry.findIndex(isItemPlateable);
+  // Still chopping: each tap drives the knife and speeds the work up.
+  if (chop.item.state === 'raw') {
+    chop.progress = Math.min(chop.duration, chop.progress + CHOP_TAP_BOOST);
+    chop.slashAnim = 1;
+    chef.actionBounce = 1;
+    game.sound.playChopThock();
+    addCookingParticles(game.stations, 172, 634, '#59cc69', 3, 'spark');
+    if (chop.progress >= chop.duration) {
+      chop.item.state = 'chopped';
+      game.sound.playPlateSnap();
+      pushToast(game.stations, 'CHOPPED — PICK IT UP [E]', '#98f5ae');
+    }
+    return;
+  }
+
+  // Finished chopping: pick the pieces back up.
+  if (!carryHasRoom(chef)) {
+    pushToast(game.stations, 'HANDS FULL — PLATE OR BIN SOMETHING FIRST', '#ff9d8a');
+    game.sound.playErrorBuzz();
+    return;
+  }
+  chef.carry.push(chop.item);
+  chop.item = null;
+  chop.progress = 0;
+  chef.actionBounce = 1;
+  game.sound.playPickup();
 }
 
-function refreshPlateStatus(plate) {
-  if (plate.items.length === 0) {
+function cookableCarriedItem(chef) {
+  return chef.carry.find((item) => {
+    const meta = INGREDIENT_META[item.kind];
+    if (!meta.needsCook) return false;
+    if (item.kind === 'egg') return item.state === 'raw';
+    return item.state === 'chopped';
+  });
+}
+
+function handleStove(game, station) {
+  const chef = game.world.chef;
+  const stove = game.stations.stoves[station.burnerIndex];
+  if (!stove) return;
+
+  // Empty pan: start searing something that is ready for the heat.
+  if (!stove.item) {
+    const rawNeedsChop = chef.carry.find(
+      (item) => INGREDIENT_META[item.kind].needsChop && item.state === 'raw',
+    );
+    if (rawNeedsChop) {
+      pushToast(
+        game.stations,
+        `${INGREDIENT_META[rawNeedsChop.kind].label.toUpperCase()} NEEDS CHOPPING FIRST`,
+        '#ff9d8a',
+      );
+      game.sound.playErrorBuzz();
+      return;
+    }
+    const item = cookableCarriedItem(chef);
+    if (!item) {
+      pushToast(game.stations, 'BRING EGG, OR CHOPPED SALMON / CHICKEN TO COOK', '#ff9d8a');
+      game.sound.playErrorBuzz();
+      return;
+    }
+    takeCarriedItem(chef, (carried) => carried === item);
+    stove.item = item;
+    stove.elapsed = 0;
+    stove.duration = COOK_DURATIONS[item.kind];
+    stove.burnElapsed = 0;
+    stove.status = 'cooking';
+    stove.sizzleCooldown = 0.4;
+    chef.actionBounce = 1;
+    game.sound.playSizzleTick();
+    return;
+  }
+
+  // Still cooking: the pan needs more time, nothing to take yet.
+  if (stove.status === 'cooking') {
+    game.sound.playSizzleTick();
+    return;
+  }
+
+  // Ready (or burnt): lift the pan's contents off, hands permitting.
+  if (!carryHasRoom(chef)) {
+    pushToast(game.stations, 'HANDS FULL — PLATE OR BIN SOMETHING FIRST', '#ff9d8a');
+    game.sound.playErrorBuzz();
+    return;
+  }
+  const wasBurnt = stove.status === 'burnt';
+  chef.carry.push(stove.item);
+  game.stations.stoves[station.burnerIndex] = emptyStove();
+  chef.actionBounce = 1;
+  game.sound.playPickup();
+  if (wasBurnt) {
+    pushToast(game.stations, 'BURNT! BIN IT WITH [X]', '#ff9d8a');
+  }
+}
+
+function handlePlating(game) {
+  const chef = game.world.chef;
+  const plate = game.stations.plate;
+
+  if (chef.carriedPlate) {
+    pushToast(game.stations, 'THAT PLATE IS DONE — TAKE IT TO THE SERVE WINDOW', '#ffe073');
+    return;
+  }
+
+  // A finished plate is waiting: pick it up with the free hand.
+  if (plate.completedRecipeId) {
+    chef.carriedPlate = { recipeId: plate.completedRecipeId };
+    plate.items = [];
     plate.completedRecipeId = null;
     plate.mismatch = false;
+    chef.actionBounce = 1;
+    game.sound.playPlateSnap();
+    pushToast(
+      game.stations,
+      `${RECIPE_MAP[chef.carriedPlate.recipeId].name.toUpperCase()} PLATED — SERVE IT!`,
+      '#98f5ae',
+    );
     return;
   }
-  const matched = matchRecipeFromItems(plate.items);
-  if (matched) {
-    plate.completedRecipeId = matched.id;
-    plate.mismatch = false;
+
+  if (chef.carry.length === 0) return;
+
+  // Place the first carried item that still leaves a dish completable.
+  const fitting = chef.carry.find(
+    (item) => getCandidateRecipes([...plate.items, item]).length > 0,
+  );
+  if (fitting) {
+    takeCarriedItem(chef, (carried) => carried === fitting);
+    plate.items.push(fitting);
+    chef.actionBounce = 1;
+    game.sound.playPlateSnap();
+    const match = matchRecipeFromItems(plate.items);
+    if (match) {
+      plate.completedRecipeId = match.id;
+      pushToast(game.stations, `${match.name.toUpperCase()} READY — PICK UP THE PLATE!`, '#98f5ae');
+    }
     return;
   }
-  const candidates = getCandidateRecipes(plate.items);
-  plate.completedRecipeId = null;
-  plate.mismatch = candidates.length === 0 || plate.items.length >= 3;
+
+  // Nothing carried fits any dish: it lands anyway and mismatches the plate.
+  const wrong = chef.carry.shift();
+  plate.items.push(wrong);
+  plate.mismatch = true;
+  chef.actionBounce = 1;
+  game.sound.playErrorBuzz();
+  pushToast(game.stations, 'WRONG INGREDIENT — PLATE MISMATCHED! BIN IT [X]', '#ff7466');
 }
 
-export function interactWithStation(game, station) {
-  const { world, stations, orders, sound } = game;
-  const chef = world.chef;
-  if (!station) return false;
+function handleServeWindow(game, station) {
+  const chef = game.world.chef;
+  const { orders, stations } = game;
 
-  chef.actionBounce = 1.0;
-
-  if (station.type === 'pantry') {
-    if (chef.carry.length >= MAX_CARRY) {
-      sound.playErrorBuzz();
-      pushToast(stations, 'HANDS FULL (MAX 3) — PREP OR PLATE FIRST', '#ff8c78');
-      return false;
-    }
-    const meta = INGREDIENT_META[station.ingredient];
-    chef.carry.push({ kind: meta.id, state: meta.initialState });
-    sound.playPickup();
-    addCookingParticles(stations, station.x + station.w * 0.5, station.y + 42, meta.accent, 6, 'spark');
-    return true;
-  }
-
-  if (station.type === 'chop') {
-    const board = stations.chop;
-    if (board.item && board.progress >= board.duration) {
-      if (chef.carry.length >= MAX_CARRY) {
-        sound.playErrorBuzz();
-        pushToast(stations, 'HANDS FULL — FREE A SLOT TO PICK UP', '#ff8c78');
-        return false;
-      }
-      chef.carry.push(board.item);
-      board.item = null;
-      board.progress = 0;
-      sound.playPickup();
-      return true;
-    }
-    if (board.item && board.progress < board.duration) {
-      // Responsive tap boost while chopping
-      board.progress = Math.min(board.duration, board.progress + 0.22);
-      board.slashAnim = 1.0;
-      sound.playChopThock();
-      addCookingParticles(
-        stations,
-        station.x + station.w * 0.5,
-        station.y + 46,
-        INGREDIENT_META[board.item.kind].accent,
-        5,
-        'spark',
-      );
-      if (board.progress >= board.duration) {
-        board.item.state = 'chopped';
-        sound.playPlateSnap();
-        if (chef.carry.length < MAX_CARRY) {
-          chef.carry.push(board.item);
-          board.item = null;
-          board.progress = 0;
-        }
-      }
-      return true;
-    }
-    const chopIdx = chef.carry.findIndex(isItemChoppable);
-    if (chopIdx === -1) {
-      sound.playErrorBuzz();
-      pushToast(stations, 'BRING RAW GREENS, SALMON, OR CHICKEN TO CHOP', '#ffd87a');
-      return false;
-    }
-    const [picked] = chef.carry.splice(chopIdx, 1);
-    board.item = picked;
-    board.progress = 0.08;
-    board.duration = CHOP_DURATION;
-    board.slashAnim = 1.0;
-    sound.playChopThock();
-    return true;
-  }
-
-  if (station.type === 'stove') {
-    const burner = stations.stoves[station.burnerIndex];
-    if (burner.item && (burner.status === 'ready' || burner.status === 'burnt')) {
-      if (chef.carry.length >= MAX_CARRY) {
-        sound.playErrorBuzz();
-        pushToast(stations, 'HANDS FULL — CLEAR A SLOT FIRST', '#ff8c78');
-        return false;
-      }
-      chef.carry.push(burner.item);
-      burner.item = null;
-      burner.elapsed = 0;
-      burner.burnElapsed = 0;
-      burner.status = 'idle';
-      sound.playPickup();
-      return true;
-    }
-    if (burner.item && burner.status === 'cooking') {
-      pushToast(stations, 'SEARING IN PAN — WAIT FOR GREEN RING', '#ffd87a');
-      return false;
-    }
-    const cookIdx = chef.carry.findIndex(isItemCookable);
-    if (cookIdx === -1) {
-      const hasRawProtein = chef.carry.some(
-        (it) => (it.kind === 'salmon' || it.kind === 'chicken') && it.state === 'raw',
-      );
-      sound.playErrorBuzz();
-      pushToast(
-        stations,
-        hasRawProtein ? 'CHOP SALMON / CHICKEN ON THE BOARD FIRST!' : 'BRING EGG OR CHOPPED PROTEIN TO SEAR',
-        '#ff9e70',
-      );
-      return false;
-    }
-    const [picked] = chef.carry.splice(cookIdx, 1);
-    burner.item = picked;
-    burner.elapsed = 0;
-    burner.burnElapsed = 0;
-    burner.duration = COOK_DURATIONS[picked.kind] || 3.0;
-    burner.status = 'cooking';
-    sound.playSizzleTick();
-    addCookingParticles(stations, station.x + station.w * 0.5, station.y + 42, '#fff0c4', 6, 'steam');
-    return true;
-  }
-
-  if (station.type === 'plating') {
-    const plate = stations.plate;
-    if (plate.completedRecipeId) {
-      if (chef.carriedPlate) {
-        sound.playErrorBuzz();
-        pushToast(stations, 'SERVE THE BENTO IN YOUR HANDS FIRST!', '#ff8c78');
-        return false;
-      }
-      chef.carriedPlate = {
-        recipeId: plate.completedRecipeId,
-        items: plate.items.slice(),
-      };
-      plate.items = [];
-      plate.completedRecipeId = null;
-      plate.mismatch = false;
-      sound.playPickup();
-      pushToast(stations, `CARRYING ${RECIPE_MAP[chef.carriedPlate.recipeId].name.toUpperCase()} → SERVE!`, '#8df0a4');
-      return true;
-    }
-    if (plate.mismatch) {
-      sound.playErrorBuzz();
-      pushToast(stations, 'WRONG MIX — PRESS [X] OR CLICK TRASH BIN (-2s)', '#ff7d6b');
-      return false;
-    }
-    const bestIdx = chooseBestCarryIndexForPlate(chef.carry, plate.items, orders.tickets);
-    if (bestIdx === -1) {
-      const hasBurnt = chef.carry.some((it) => it.state === 'burnt');
-      const hasUnprepped = chef.carry.some((it) => !isItemPlateable(it) && it.state !== 'burnt');
-      sound.playErrorBuzz();
-      if (hasBurnt) {
-        pushToast(stations, 'BIN BURNT FOOD [X] — CANNOT PLATE', '#ff7d6b');
-      } else if (hasUnprepped) {
-        pushToast(stations, 'CHOP OR COOK INGREDIENTS BEFORE PLATING', '#ffd87a');
-      } else {
-        pushToast(stations, 'BRING PREPARED INGREDIENTS TO ASSEMBLE', '#ffd87a');
-      }
-      return false;
-    }
-    const [placed] = chef.carry.splice(bestIdx, 1);
-    plate.items.push(placed);
-    plate.flash = 0.5;
-    refreshPlateStatus(plate);
-    sound.playPlateSnap();
-    addCookingParticles(stations, station.x + station.w * 0.5, station.y + 48, '#ffdf88', 7, 'spark');
-
-    if (plate.completedRecipeId) {
-      const rec = RECIPE_MAP[plate.completedRecipeId];
-      sound.playCookReadyDing();
-      addPopup(stations, station.x + station.w * 0.5, station.y - 10, `${rec.shortName.toUpperCase()} READY!`, '#90f2a6');
-    } else if (plate.mismatch) {
-      sound.playErrorBuzz();
-      pushToast(stations, 'NO MATCHING RECIPE — BIN WITH [X] (-2s)', '#ff7d6b');
-    } else {
-      const targetRec = getPrioritizedCandidateRecipe(plate.items, orders.tickets);
-      const missing = getMissingIngredients(targetRec, plate.items);
-      if (targetRec && missing.length > 0) {
-        const nextNeed = INGREDIENT_META[missing[0].kind];
-        pushToast(stations, `${targetRec.shortName.toUpperCase()} (${plate.items.length}/3) — NEXT: ${nextNeed.shortLabel}`, '#ffe394');
-      }
-    }
-    return true;
-  }
-
-  if (station.type === 'serve') {
-    if (!chef.carriedPlate) {
-      // Convenience: if plate is completed on plating counter, prompt clearly
-      if (stations.plate.completedRecipeId) {
-        pushToast(stations, 'PICK UP THE FINISHED BENTO FROM PLATING FIRST!', '#ffd87a');
-      } else {
-        pushToast(stations, 'ASSEMBLE A COMPLETE 3-ITEM BENTO TO SERVE', '#ffd87a');
-      }
-      sound.playErrorBuzz();
-      return false;
-    }
+  if (chef.carriedPlate) {
+    const recipe = RECIPE_MAP[chef.carriedPlate.recipeId];
     const ticket = findMatchingTicket(orders, chef.carriedPlate.recipeId);
     if (!ticket) {
-      sound.playErrorBuzz();
-      pushToast(stations, 'NO ACTIVE TICKET FOR THAT DISH — WAIT OR BIN [X]', '#ff9575');
-      return false;
+      pushToast(
+        game.stations,
+        `NO TICKET FOR ${recipe.shortName.toUpperCase()} — HOLD THE PLATE`,
+        '#ff9d8a',
+      );
+      game.sound.playErrorBuzz();
+      return;
     }
     const result = scoreServedOrder(orders, ticket, game.timeLeft);
-    stations.serveShowcase = {
-      recipeId: chef.carriedPlate.recipeId,
-      timer: 3.4,
-      label: result.recipe.shortName,
-    };
     chef.carriedPlate = null;
-    sound.playServeBell(result.multiplier);
-    const px = station.x + 81;
-    const py = station.y + 132;
-    addCookingParticles(stations, px, py + 48, '#ffd966', 16, 'spark');
-    addCookingParticles(stations, px, py + 48, '#ff7f50', 10, 'spark');
-    const sub = result.fastTip > 0 ? `FAST TIP +${result.fastTip}` : `${result.recipe.shortName.toUpperCase()}`;
+    chef.actionBounce = 1;
+    stations.serveShowcase = { recipeId: recipe.id, timer: 3.5, label: recipe.name };
     addPopup(
       stations,
-      px - 36,
-      py,
+      station.x - 18,
+      station.y + 84,
       `+${result.totalPoints} COMBO x${result.multiplier}`,
-      '#ffe570',
-      sub,
+      '#ffe875',
+      result.fastTip > 0 ? `FAST TIP +${result.fastTip}` : '',
     );
-    return true;
+    addCookingParticles(stations, station.x + 81, station.y + 190, '#ffe066', 14, 'spark');
+    addCookingParticles(stations, station.x + 81, station.y + 190, '#ff7d54', 8, 'spark');
+    game.sound.playServeBell(orders.streak);
+    return;
   }
 
-  if (station.type === 'trash') {
-    return discardCarriedOrPlate(game);
+  if (chef.carry.length > 0) {
+    pushToast(game.stations, 'FINISH THE DISH ON THE PLATING COUNTER FIRST', '#ffe073');
+    return;
   }
-
-  return false;
+  pushToast(game.stations, 'NOTHING TO SERVE — PLATE A DISH FIRST', '#ffe073');
 }
 
 export function discardCarriedOrPlate(game) {
-  const { world, stations, sound } = game;
-  const chef = world.chef;
+  const chef = game.world.chef;
+  const plate = game.stations.plate;
 
-  // 1. Toss burnt carried item first with no penalty.
-  const burntIdx = chef.carry.findIndex((it) => it.state === 'burnt');
-  if (burntIdx !== -1) {
-    chef.carry.splice(burntIdx, 1);
-    sound.playBinDiscard();
-    pushToast(stations, 'BURNT FOOD DISCARDED', '#d6d0c4');
-    return true;
-  }
-
-  // 2. Toss carried wrong plate with small time penalty.
   if (chef.carriedPlate) {
     chef.carriedPlate = null;
-    game.timeLeft = Math.max(1, game.timeLeft - BIN_PENALTY_SECONDS);
-    sound.playBinDiscard();
-    addPopup(stations, chef.x, chef.y - 36, 'PLATE BINNED (-2s)', '#ff8d78');
-    return true;
+    game.sound.playBinDiscard();
+    pushToast(game.stations, 'PLATE BINNED', '#ff9d8a');
+    return;
   }
 
-  // 3. Toss plate on plating counter if mismatched or chef is adjacent to plating/trash.
-  if (stations.plate.items.length > 0 && (stations.plate.mismatch || world.activeStationId === 'plating' || world.activeStationId === 'trash')) {
-    stations.plate.items = [];
-    stations.plate.completedRecipeId = null;
-    stations.plate.mismatch = false;
-    game.timeLeft = Math.max(1, game.timeLeft - BIN_PENALTY_SECONDS);
-    sound.playBinDiscard();
-    const ps = STATION_BY_ID.plating;
-    addPopup(stations, ps.x + ps.w * 0.5, ps.y - 12, 'PLATE BINNED (-2s)', '#ff8d78');
-    return true;
-  }
-
-  // 4. Scrape burnt pan if adjacent to it.
-  for (let i = 0; i < stations.stoves.length; i++) {
-    const burner = stations.stoves[i];
-    if (burner.status === 'burnt' && world.activeStationId === `stove_${i}`) {
-      burner.item = null;
-      burner.elapsed = 0;
-      burner.burnElapsed = 0;
-      burner.status = 'idle';
-      sound.playBinDiscard();
-      pushToast(stations, 'BURNT PAN SCRAPED CLEAN', '#d6d0c4');
-      return true;
-    }
-  }
-
-  // 5. Discard top carried loose ingredient.
   if (chef.carry.length > 0) {
-    chef.carry.pop();
-    sound.playBinDiscard();
-    pushToast(stations, 'ITEM BINNED', '#d6d0c4');
-    return true;
+    chef.carry = [];
+    game.sound.playBinDiscard();
+    pushToast(game.stations, 'CARRIED ITEMS BINNED', '#ff9d8a');
+    return;
   }
 
-  return false;
+  if (plate.items.length > 0) {
+    const wasMismatch = plate.mismatch;
+    plate.items = [];
+    plate.completedRecipeId = null;
+    plate.mismatch = false;
+    game.sound.playBinDiscard();
+    if (wasMismatch) {
+      game.timeLeft = Math.max(0, game.timeLeft - WRONG_PLATE_PENALTY);
+      pushToast(game.stations, `WRONG PLATE BINNED −${WRONG_PLATE_PENALTY}s`, '#ff7466');
+    } else {
+      pushToast(game.stations, 'PLATE CLEARED', '#ff9d8a');
+    }
+    return;
+  }
+
+  pushToast(game.stations, 'NOTHING TO BIN', '#cbbfa8');
+}
+
+export function interactWithStation(game, station) {
+  if (!station || game.mode === 'title' || game.mode === 'end') return;
+  switch (station.type) {
+    case 'pantry':
+      handlePantry(game, station);
+      break;
+    case 'chop':
+      handleChopBoard(game);
+      break;
+    case 'stove':
+      handleStove(game, station);
+      break;
+    case 'plating':
+      handlePlating(game);
+      break;
+    case 'trash':
+      discardCarriedOrPlate(game);
+      break;
+    case 'serve':
+      handleServeWindow(game, station);
+      break;
+    default:
+      break;
+  }
 }
 
 export function updateCookingStations(game, dt) {
-  const { world, stations, sound } = game;
-  const chef = world.chef;
+  const { stations } = game;
+  const chop = stations.chop;
 
-  // Chopping board progresses automatically while chef stands beside it.
-  const chopStation = STATION_BY_ID.chop;
-  const board = stations.chop;
-  if (board.slashAnim > 0) board.slashAnim = Math.max(0, board.slashAnim - dt * 4.5);
+  if (chop.slashAnim > 0) {
+    chop.slashAnim = Math.max(0, chop.slashAnim - dt * 3);
+  }
 
-  if (board.item && board.progress < board.duration) {
-    const nearChop = distanceToStation(chef.x, chef.y, chopStation) <= 84;
-    if (nearChop) {
-      board.progress = Math.min(board.duration, board.progress + dt);
-      board.thockCooldown -= dt;
-      if (board.thockCooldown <= 0) {
-        board.thockCooldown = 0.24;
-        board.slashAnim = 0.85;
-        sound.playChopThock();
+  // The board works on its own, slowly; tapping the knife hurries it along.
+  if (chop.item && chop.item.state === 'raw') {
+    chop.progress = Math.min(chop.duration, chop.progress + dt * CHOP_AUTO_RATE);
+    if (chop.progress >= chop.duration) {
+      chop.item.state = 'chopped';
+      game.sound.playPlateSnap();
+      addCookingParticles(stations, 172, 634, '#59cc69', 4, 'spark');
+    }
+  }
+
+  const panCenters = [398, 560];
+  for (let s = 0; s < stations.stoves.length; s++) {
+    const stove = stations.stoves[s];
+    if (!stove.item) continue;
+    if (stove.status === 'cooking') {
+      stove.elapsed += dt;
+      stove.sizzleCooldown -= dt;
+      if (stove.sizzleCooldown <= 0) {
+        stove.sizzleCooldown = 0.5;
+        game.sound.playSizzleTick();
         addCookingParticles(
           stations,
-          chopStation.x + chopStation.w * 0.5,
-          chopStation.y + 44,
-          INGREDIENT_META[board.item.kind].accent,
-          3,
-          'spark',
+          panCenters[s],
+          620,
+          'rgba(255,244,218,0.85)',
+          1,
+          'steam',
         );
       }
-      if (board.progress >= board.duration) {
-        board.item.state = 'chopped';
-        sound.playPlateSnap();
-        if (chef.carry.length < MAX_CARRY) {
-          chef.carry.push(board.item);
-          board.item = null;
-          board.progress = 0;
-        }
+      if (stove.elapsed >= stove.duration) {
+        stove.item.state = INGREDIENT_META[stove.item.kind].plateState;
+        stove.status = 'ready';
+        stove.burnElapsed = 0;
+        game.sound.playCookReadyDing();
+      }
+    } else if (stove.status === 'ready') {
+      stove.burnElapsed += dt;
+      if (stove.burnElapsed >= BURN_LIMIT) {
+        stove.status = 'burnt';
+        stove.item.state = 'burnt';
+        game.sound.playErrorBuzz();
+        pushToast(stations, 'PAN BURNT! PICK IT UP & BIN IT [X]', '#ff7466');
       }
     }
   }
 
-  // Stove burners cook over time, then enter burn grace before charring.
-  for (let i = 0; i < stations.stoves.length; i++) {
-    const burner = stations.stoves[i];
-    const stDef = STATION_BY_ID[`stove_${i}`];
-    if (!burner.item) continue;
-
-    if (burner.status === 'cooking') {
-      burner.elapsed += dt;
-      burner.sizzleCooldown -= dt;
-      if (burner.sizzleCooldown <= 0) {
-        burner.sizzleCooldown = 0.42;
-        sound.playSizzleTick();
-        addCookingParticles(stations, stDef.x + stDef.w * 0.5, stDef.y + 40, 'rgba(255,244,218,0.85)', 2, 'steam');
-      }
-      if (burner.elapsed >= burner.duration) {
-        burner.status = 'ready';
-        burner.item.state = 'cooked';
-        burner.burnElapsed = 0;
-        sound.playCookReadyDing();
-        addCookingParticles(stations, stDef.x + stDef.w * 0.5, stDef.y + 44, '#88f09c', 8, 'spark');
-      }
-    } else if (burner.status === 'ready') {
-      burner.burnElapsed += dt;
-      burner.sizzleCooldown -= dt;
-      if (burner.sizzleCooldown <= 0) {
-        burner.sizzleCooldown = burner.burnElapsed > BURN_GRACE * 0.55 ? 0.25 : 0.55;
-        const smokeColor = burner.burnElapsed > BURN_GRACE * 0.6 ? 'rgba(255,150,90,0.8)' : 'rgba(255,240,210,0.65)';
-        addCookingParticles(stations, stDef.x + stDef.w * 0.5, stDef.y + 38, smokeColor, 2, 'steam');
-      }
-      if (burner.burnElapsed >= BURN_GRACE) {
-        burner.status = 'burnt';
-        burner.item.state = 'burnt';
-        sound.playErrorBuzz();
-        pushToast(stations, `PAN ${i + 1} BURNT! PICK UP & BIN [X]`, '#ff6e5a');
-        addCookingParticles(stations, stDef.x + stDef.w * 0.5, stDef.y + 40, 'rgba(65,60,65,0.85)', 10, 'steam');
-      }
-    } else if (burner.status === 'burnt') {
-      burner.sizzleCooldown -= dt;
-      if (burner.sizzleCooldown <= 0) {
-        burner.sizzleCooldown = 0.45;
-        addCookingParticles(stations, stDef.x + stDef.w * 0.5, stDef.y + 38, 'rgba(60,55,62,0.75)', 2, 'steam');
-      }
-    }
+  for (let i = stations.particles.length - 1; i >= 0; i--) {
+    const p = stations.particles[i];
+    p.life -= dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    if (p.kind === 'steam') p.vx *= 1 - dt * 0.4;
+    if (p.life <= 0) stations.particles.splice(i, 1);
   }
 
-  if (stations.plate.flash > 0) {
-    stations.plate.flash = Math.max(0, stations.plate.flash - dt);
+  for (let i = stations.popups.length - 1; i >= 0; i--) {
+    const popup = stations.popups[i];
+    popup.timer -= dt;
+    popup.y -= dt * 26;
+    if (popup.timer <= 0) stations.popups.splice(i, 1);
   }
-  if (stations.serveShowcase.timer > 0) {
-    stations.serveShowcase.timer = Math.max(0, stations.serveShowcase.timer - dt);
-    if (stations.serveShowcase.timer === 0) {
-      stations.serveShowcase.recipeId = null;
-    }
-  }
+
   if (stations.toast.timer > 0) {
     stations.toast.timer = Math.max(0, stations.toast.timer - dt);
   }
 
-  updateParticlesAndPopups(stations, dt);
+  if (stations.serveShowcase) {
+    stations.serveShowcase.timer -= dt;
+    if (stations.serveShowcase.timer <= 0) stations.serveShowcase = null;
+  }
 }
 
-export function updateParticlesAndPopups(stations, dt) {
-  for (let i = stations.particles.length - 1; i >= 0; i--) {
-    const p = stations.particles[i];
-    p.age += dt;
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-    if (p.kind !== 'steam') {
-      p.vy += 120 * dt;
-    }
-    if (p.age >= p.life) stations.particles.splice(i, 1);
-  }
-  for (let i = stations.popups.length - 1; i >= 0; i--) {
-    const pop = stations.popups[i];
-    pop.age += dt;
-    pop.y -= 26 * dt;
-    if (pop.age >= pop.life) stations.popups.splice(i, 1);
-  }
+// Helper for renderers that want the dish the plate is heading toward.
+export function getPlateTargetRecipe(game) {
+  return getPrioritizedCandidateRecipe(game.stations.plate.items, game.orders.tickets);
 }
