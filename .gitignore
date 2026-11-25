@@ -1,0 +1,7 @@
+# Temporary packaging outputs and local captures
+out/
+out1/
+out2/
+transcripts.tar.gz
+*.log
+.DS_Store
